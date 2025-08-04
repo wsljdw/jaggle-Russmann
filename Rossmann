@@ -1,0 +1,251 @@
+# 导入库
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.preprocessing import LabelEncoder
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import mean_squared_error
+import lightgbm as lgb
+import xgboost as xgb
+from catboost import CatBoostRegressor
+
+# 读取训练集、门店信息、测试集
+train = pd.read_csv('/kaggle/input/rossmann-store-sales/train.csv')
+store = pd.read_csv('/kaggle/input/rossmann-store-sales/store.csv')
+test = pd.read_csv('/kaggle/input/rossmann-store-sales/test.csv')
+
+# 检查数据
+print(f"训练集行数: {train.shape[0]} | 列数: {train.shape[1]}")
+print(f"门店信息行数: {store.shape[0]} | 列数: {store.shape[1]}")
+print(f"测试集行数: {test.shape[0]} | 列数: {test.shape[1]}")
+
+#重命名列名保持一致性
+train = train.rename(columns={'store': 'Store'})
+test = test.rename(columns={'store': 'Store'})
+store = store.rename(columns={'store': 'Store'})
+
+#合并门店信息
+train = pd.merge(train, store, on='Store', how='left')
+test = pd.merge(test, store, on='Store', how='left')
+
+#检查合并后列名
+print("合并后train列名:", train.columns.tolist())
+print("合并后test列名:", test.columns.tolist())
+#数据预处理
+import calendar
+
+# 日期特征工程
+for df in [train, test]:
+    df['Date'] = pd.to_datetime(df['Date'])
+    df['Year'] = df['Date'].dt.year
+    df['Month'] = df['Date'].dt.month
+    df['Week'] = df['Date'].dt.isocalendar().week
+    df['DayOfWeek'] = df['Date'].dt.dayofweek
+    df['DayOfMonth'] = df['Date'].dt.day
+    df['IsWeekend'] = (df['DayOfWeek'] >= 5).astype(int)
+    
+    # Promo2Active特征 
+    df['Promo2Active'] = 0
+    promo2_mask = (df['Promo2'] == 1) & (~df['Promo2SinceYear'].isna()) & (~df['Promo2SinceWeek'].isna())
+    # 将周数转换为月份的第一天 
+    def week_to_month_start(row):
+        try:
+            year = int(row['Promo2SinceYear'])
+            week = int(row['Promo2SinceWeek'])
+            # 获取该年的第一天的日期
+            first_day = pd.Timestamp(f'{year}-01-01')
+            # 计算该周的第一天 (周一)
+            start_date = first_day + pd.Timedelta(days=(week-1)*7 - first_day.weekday())
+            return start_date
+        except:
+            return pd.NaT
+    
+ # 应用转换
+    df.loc[promo2_mask, 'Promo2StartDate'] = df[promo2_mask].apply(week_to_month_start, axis=1)
+    
+    # 检查当前日期是否在促销期间
+    promo_active_mask = promo2_mask & (~df['Promo2StartDate'].isna())
+    df.loc[promo_active_mask, 'Promo2Active'] = (
+        (df.loc[promo_active_mask, 'Date'] >= df.loc[promo_active_mask, 'Promo2StartDate']) & 
+        (df.loc[promo_active_mask, 'Date'].dt.month.astype(str).str.zfill(2).isin(
+            df.loc[promo_active_mask, 'PromoInterval'].str.split(',').fillna('')
+        ))
+    ).astype(int)
+    
+ # 竞争对手特征 - 添加异常值处理
+    df['CompetitionOpen'] = 12 * (df['Year'] - df['CompetitionOpenSinceYear'].fillna(0)) + \
+                            (df['Month'] - df['CompetitionOpenSinceMonth'].fillna(0))
+    df['CompetitionOpen'] = df['CompetitionOpen'].apply(lambda x: max(x, 0))  # 确保非负
+    df['HasCompetition'] = (df['CompetitionOpen'] > 0).astype(int)
+    
+# 处理缺失值 - 更安全的方法
+    df['CompetitionDistance'] = df['CompetitionDistance'].fillna(
+        df['CompetitionDistance'].median())
+    
+    # 处理年份和月份缺失值
+    df['CompetitionOpenSinceYear'] = df['CompetitionOpenSinceYear'].fillna(0)
+    df['CompetitionOpenSinceMonth'] = df['CompetitionOpenSinceMonth'].fillna(0)
+    df['Promo2SinceYear'] = df['Promo2SinceYear'].fillna(0)
+df['Promo2SinceWeek'] = df['Promo2SinceWeek'].fillna(0)
+
+# 仅使用开门日的数据 (业务逻辑)
+train = train[(train['Open'] == 1) & (train['Sales'] > 0)]
+
+# 检查修复后的数据
+print("修复后数据预览:")
+print(train[['Store', 'Date', 'Promo2', 'Promo2SinceYear', 'Promo2SinceWeek', 'Promo2Active']].head(10))
+
+# 检查缺失值
+print("\n缺失值统计:")
+print(train.isnull().sum())
+# 确定数据实际时间范围
+min_date = train['Date'].min().date()
+max_date = train['Date'].max().date()
+print(f"训练数据实际时间范围: {min_date} 至 {max_date}")
+
+# 调整验证集时间 - 使用最后4周作为验证集
+val_start = train['Date'].max() - pd.Timedelta(weeks=4)
+train_end = val_start - pd.Timedelta(days=1)
+
+# 划分训练集和测试集
+train_set = train[train['Date'] <= train_end]
+val_set = train[train['Date'] >= val_start]
+
+# 确保没有重叠
+overlap = pd.merge(train_set, val_set, on=['Store', 'Date'], how='inner')
+if not overlap.empty:
+    print(f"警告: 训练集和验证集有 {len(overlap)} 条重叠记录")
+    # 重新划分，确保无重叠
+    val_set = train[train['Date'] > train_end]
+
+# 打印划分结果
+print(f"训练集时间范围: {train_set['Date'].min().date()} 至 {train_set['Date'].max().date()}")
+print(f"验证集时间范围: {val_set['Date'].min().date()} 至 {val_set['Date'].max().date()}")
+print(f"训练集大小: {len(train_set):,} 条记录")
+print(f"验证集大小: {len(val_set):,} 条记录")
+#进行基础EDA（可视化）
+plt.figure(figsize=(12, 6))
+train.groupby(train_set['Date'].dt.month)['Sales'].mean().plot(kind='bar', color='skyblue')
+plt.title('月平均销售额趋势')
+plt.xlabel('月份')
+plt.ylabel('平均销售额')
+plt.show()
+
+# 促销对销售额的影响
+plt.figure(figsize=(10, 6))
+sns.boxplot(x='Promo', y='Sales', data=train_set, palette='Set2')
+plt.title('促销活动对销售额的影响')
+plt.yscale('log')  # 对数刻度使分布更清晰
+plt.show()
+
+# 门店类型与销售额的关系
+plt.figure(figsize=(10, 6))
+sns.violinplot(x='StoreType', y='Sales', data=train_set, inner='quartile', palette='viridis')
+plt.title('不同类型门店的销售额分布')
+plt.show()
+# 历史统计特征
+def add_historical_features(df, train_df):
+    historical = train_df.groupby('Store').agg({
+        'Sales': ['mean', 'median', 'std', 'min', 'max'],
+        'Customers': 'mean'
+    })
+    historical.columns = ['_'.join(col).strip() for col in historical.columns.values]
+    historical = historical.reset_index()
+    
+    return pd.merge(df, historical, on='Store', how='left')
+train_set = add_historical_features(train_set, train_set[train_set['Date'] < train_set['Date'].max() - pd.Timedelta(days=30)])
+val_set = add_historical_features(val_set, train_set)
+test = add_historical_features(test, train_set)
+#节假日
+holiday_features = {
+    'Christmas2014': '2014-12-24',
+    'Easter2014': '2014-04-20',
+    'Christmas2015': '2015-12-24',
+    'Easter2015': '2015-04-05',
+    'BackToSchool': '2015-08-15'
+}
+
+for name, date_str in holiday_features.items():
+    for df in [train_set, val_set, test]:
+        df[f'DaysTo{name}'] = (pd.to_datetime(date_str) - df['Date']).dt.days.apply(
+            lambda x: x if x > 0 else 0)
+        df[f'DaysAfter{name}'] = (df['Date'] - pd.to_datetime(date_str)).dt.days.apply(
+            lambda x: x if x > 0 else 0)
+# 自定义SMAPE评估函数
+import lightgbm as lgb
+def smape(y_true, y_pred):
+    return 100/len(y_true) * np.sum(2 * np.abs(y_pred - y_true) / (np.abs(y_true) + np.abs(y_pred)))
+
+# 特征选择
+features = ['Store', 'DayOfWeek', 'Promo', 'Year', 'Month', 'Week', 
+            'IsWeekend', 'Promo2Active', 'CompetitionDistance',
+            'HasCompetition', 'CompetitionOpen', 'Sales_mean', 
+            'DaysToChristmas2015', 'DaysAfterChristmas2015',
+            'DaysToEaster2015', 'DaysAfterEaster2015',
+            'DaysToBackToSchool', 'StoreType', 'Assortment']
+
+# 类别特征编码
+cat_cols = ['StoreType', 'Assortment']
+for col in cat_cols:
+    le = LabelEncoder()
+    train_set[col] = le.fit_transform(train_set[col])
+    val_set[col] = le.transform(val_set[col])
+    test[col] = le.transform(test[col])
+
+# 准备数据
+X_train = train_set[features]
+y_train = train_set['Sales']
+X_val   = val_set[features]
+y_val   = val_set['Sales']
+# 创建LightGBM数据集
+dtrain = lgb.Dataset(X_train, label=y_train, categorical_feature=cat_cols)
+dval = lgb.Dataset(X_val, label=y_val, categorical_feature=cat_cols, reference=dtrain)
+# LightGBM参数
+params = {
+    'objective': 'regression',
+    'metric': 'mae',
+    'boosting_type': 'gbdt',
+    'num_leaves': 31,
+    'learning_rate': 0.05,
+    'feature_fraction': 0.9,
+    'bagging_fraction': 0.8,
+    'bagging_freq': 5,
+    'verbose': -1,
+    'seed': 42
+}
+
+# 训练模型（修复参数）
+model = lgb.train(
+    params,
+    dtrain,
+    num_boost_round=1000,
+    valid_sets=[dval],
+    callbacks=[
+        lgb.early_stopping(stopping_rounds=50, verbose=True),
+        lgb.log_evaluation(period=100)
+    ]
+)
+
+# 验证集预测
+val_pred = model.predict(X_val)
+
+# 计算SMAPE
+smape_val = smape(y_val.values, val_pred)
+print(f'Validation SMAPE: {smape_val:.4f}%')
+
+test_pred = model.predict(test[features])
+# 特征重要性可视化
+lgb.plot_importance(model, figsize=(12, 8), max_num_features=20)
+plt.title('Feature Importance')
+plt.show()
+
+# 业务解读
+top_features = pd.DataFrame({
+    'Feature': features,
+    'Importance': model.feature_importance()
+}).sort_values('Importance', ascending=False).head(10)
+
+print("Top 10 Features:")
+for i, row in top_features.iterrows():
+print(f"{row['Feature']}: {row['Importance']:.1f}")
